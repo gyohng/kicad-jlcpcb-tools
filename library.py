@@ -391,6 +391,7 @@ class Library:
 
             # try retrieving from the cached index first (LCSC Part indexing from FTS5 parts is sloooooow)
             try:
+                numbers = ",".join([f'"{n}"' for n in lcsc])
                 rows = cur.execute(f"SELECT lcsc, partsId FROM parts_by_lcsc where lcsc IN ({numbers})").fetchall()
 
                 # orphaned parts found
