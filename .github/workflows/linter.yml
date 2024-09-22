@@ -22,11 +22,22 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Check code with ruff
+        uses: chartboost/ruff-action@v1
+        with:
+          version: 0.5.6
+          args: check 
+          src: "."
+  deadcode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install ruff
-        run: pip install ruff
-      - name: Run ruff
-        run: ruff check $(git ls-files '*.py')
+      - name: Install deadcode
+        run: pip install deadcode
+      - name: Run deadcode
+        run: deadcode .

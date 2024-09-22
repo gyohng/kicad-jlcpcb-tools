@@ -273,9 +273,9 @@ class Fabrication:
                 part = self.parent.store.get_part(fp.GetReference())
                 if not part:  # No matching part in the database, continue
                     continue
-                if part[6] == 1:  # Exclude from POS
+                if part["exclude_from_pos"] == 1:
                     continue
-                if not add_without_lcsc and not part[3]:
+                if not add_without_lcsc and not part["lcsc"]:
                     continue
                 try:  # Kicad <= 8.0
                     position = self.get_position(fp) - aux_orgin
@@ -285,9 +285,9 @@ class Fabrication:
                     position = VECTOR2I(x1 - x2, y1 - y2)
                 writer.writerow(
                     [
-                        part[0],
-                        part[1],
-                        part[2],
+                        part["reference"],
+                        part["value"],
+                        part["footprint"],
                         ToMM(position.x),
                         ToMM(position.y) * -1,
                         self.fix_rotation(fp),
@@ -308,21 +308,27 @@ class Fabrication:
             os.path.join(self.outputdir, bomname), "w", newline="", encoding="utf-8"
         ) as csvfile:
             writer = csv.writer(csvfile, delimiter=",")
-            writer.writerow(["Comment", "Designator", "Footprint", "LCSC"])
+            writer.writerow(["Comment", "Designator", "Footprint", "LCSC", "Quantity"])
             for part in self.parent.store.read_bom_parts():
-                components = part[1].split(",")
+                components = part["refs"].split(",")
                 for component in components:
                     for fp in self.board.Footprints():
-                        if fp.GetReference() == component and fp.IsDNP():
+                        if fp.GetReference() == component and hasattr(fp, "IsDNP") and callable(fp.IsDNP) and fp.IsDNP():
                             components.remove(component)
-                            part[1] = ",".join(components)
+                            part["refs"] = ",".join(components)
                             self.logger.info(
-                                "Component %s has 'Do not placed' enabled: removing from BOM",
+                                "Component %s has 'Do not place' enabled: removing from BOM",
                                 component,
                             )
-                if not add_without_lcsc and not part[3]:
+                if not add_without_lcsc and not part["lcsc"]:
+                    self.logger.info(
+                        "Component %s has no LCSC number assigned and the setting Add parts without LCSC is disabled: removing from BOM",
+                        component,
+                    )
                     continue
-                writer.writerow(part)
+                writer.writerow(
+                    [part["value"], part["refs"], part["footprint"], part["lcsc"], len(components)]
+                )
         self.logger.info(
             "Finished generating BOM file %s", os.path.join(self.outputdir, bomname)
         )

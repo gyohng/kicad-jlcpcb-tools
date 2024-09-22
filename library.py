@@ -19,7 +19,7 @@ from .events import (
     ResetGaugeEvent,
     UpdateGaugeEvent,
 )
-from .helpers import PLUGIN_PATH, natural_sort_collation
+from .helpers import PLUGIN_PATH, dict_factory, natural_sort_collation
 from .unzip_parts import unzip_parts
 
 
@@ -33,9 +33,6 @@ class LibraryState(Enum):
 
 class Library:
     """A storage class to get data from a sqlite database and write it back."""
-
-    # no longer works
-    CSV_URL = "https://jlcpcb.com/componentSearch/uploadComponentInfo"
 
     def __init__(self, parent):
         self.logger = logging.getLogger(__name__)
@@ -355,17 +352,6 @@ class Library:
                 ).fetchall()
             ]
 
-    def update_meta_data(self, filename, size, partcount, date, last_update):
-        """Update the meta data table."""
-        with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
-            cur.execute("DELETE from meta")
-            cur.commit()
-            cur.execute(
-                "INSERT INTO meta VALUES (?, ?, ?, ?, ?)",
-                (filename, size, partcount, date, last_update),
-            )
-            cur.commit()
-
     def create_parts_table(self, columns):
         """Create the parts table."""
         with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
@@ -373,56 +359,14 @@ class Library:
             cur.execute(f"CREATE TABLE IF NOT EXISTS parts ({cols})")
             cur.commit()
 
-    def insert_parts(self, data, cols):
-        """Insert many parts at once."""
+    def get_part_details(self, number: str) -> dict:
+        """Get the part details for a LCSC number using optimized FTS5 querying."""
         with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con:
-            cols = ",".join(["?"] * cols)
-            query = f"INSERT INTO parts VALUES ({cols})"
-            con.executemany(query, data)
-            con.commit()
-
-    def get_part_details(self, lcsc):
-        """Get the part details for a list of LCSC numbers using optimized FTS5 querying."""
-        with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con:
-            con.row_factory = sqlite3.Row  # To access columns by names
+            con.row_factory = dict_factory  # noqa: DC05
             cur = con.cursor()
-            results = []
-            query = '''SELECT "LCSC Part", "Stock", "Library Type" FROM parts WHERE parts MATCH ?'''
-
-            # try retrieving from the cached index first (LCSC Part indexing from FTS5 parts is sloooooow)
-            try:
-                numbers = ",".join([f'"{n}"' for n in lcsc])
-                rows = cur.execute(f"SELECT lcsc, partsId FROM parts_by_lcsc where lcsc IN ({numbers})").fetchall()
-
-                # orphaned parts found
-                if len(rows) != len(lcsc):
-                    rowid_by_lcsc = dict(rows)
-                    for lc in lcsc:
-                        if lc not in rowid_by_lcsc:
-                            self.logger.debug("LCSC Part `%s` not found in the database.", lc)
-
-                numbers = ",".join([f'"{r[0]}"' for r in rows])
-                return cur.execute(
-                    f'SELECT "LCSC Part", "Stock", "Library Type" FROM parts where rowid IN ({numbers})'
-                ).fetchall()
-            except Exception as e:
-                self.logger.debug(repr(e))
-                pass
-
-            # fall back to the direct approach
-            try:
-                # Use parameter binding to prevent SQL injection and handle the query more efficiently
-                for number in lcsc:
-                    # Each number needs to be wrapped in double quotes for exact match in FTS5
-                    match_query = f'"LCSC Part:{number}"'
-                    cur.execute(query, (match_query,))
-                    results.extend(cur.fetchall())
-                return results
-            except sqlite3.OperationalError:
-                # parts tabble doesn't exist. can indicate our database is corrupt or we weren't able
-                # to populate from the URL.
-                # act like we returned nothing then.
-                return []
+            query = """SELECT "LCSC Part" AS lcsc, "Stock" AS stock, "Library Type" AS type FROM parts WHERE parts MATCH :number"""
+            cur.execute(query, {"number": number})
+            return next((n for n in cur.fetchall() if n["lcsc"] == number), {})
 
     def update(self):
         """Update the sqlite parts database from the JLCPCB CSV."""
@@ -505,8 +449,9 @@ class Library:
 
                     size = int(r.headers.get("Content-Length"))
                     self.logger.debug(
-                        "Download parts db chunk %d with a size of %.2fMB",
+                        "Download parts db chunk %d of %d with a size of %.2fMB",
                         i + 1,
+                        cnt,
                         size / 1024 / 1024,
                     )
                     for data in r.iter_content(chunk_size=4096):
@@ -689,3 +634,14 @@ class Library:
                 self.logger.debug("Droped mappings table from parts database.")
             except sqlite3.OperationalError:
                 return
+
+    def get_last_update(self) -> str:
+        """Get last update from meta table."""
+        with contextlib.closing(sqlite3.connect(self.partsdb_file)) as con, con as cur:
+            try:
+                last_update = cur.execute("SELECT last_update FROM meta").fetchone()
+                if last_update:
+                    return last_update[0]
+                return ""
+            except sqlite3.OperationalError:
+                return ""

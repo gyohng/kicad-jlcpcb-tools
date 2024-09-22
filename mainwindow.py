@@ -1,5 +1,6 @@
 """Contains the main window of the plugin."""
 
+from datetime import datetime as dt
 import json
 import logging
 import os
@@ -10,9 +11,9 @@ import time
 import pcbnew as kicad_pcbnew
 import wx  # pylint: disable=import-error
 from wx import adv  # pylint: disable=import-error
-import wx.dataview  # pylint: disable=import-error
+import wx.dataview as dv  # pylint: disable=import-error
 
-from .const import Column
+from .datamodel import PartListDataModel
 from .events import (
     EVT_ASSIGN_PARTS_EVENT,
     EVT_LOGBOX_APPEND_EVENT,
@@ -26,12 +27,11 @@ from .events import (
 from .fabrication import Fabrication
 from .helpers import (
     PLUGIN_PATH,
-    GetListIcon,
     GetScaleFactor,
     HighResWxSize,
     getVersion,
     loadBitmapScaled,
-    loadIconScaled,
+    set_lcsc_value,
     toggle_exclude_from_bom,
     toggle_exclude_from_pos,
 )
@@ -54,7 +54,7 @@ ID_MAPPINGS = 3
 ID_DOWNLOAD = 4
 ID_SETTINGS = 5
 ID_SELECT_PART = 6
-ID_REMOVE_PART = 7
+ID_REMOVE_LCSC_NUMBER = 7
 ID_SELECT_ALIKE = 8
 ID_TOGGLE_BOM_POS = 9
 ID_TOGGLE_BOM = 10
@@ -64,8 +64,12 @@ ID_HIDE_BOM = 13
 ID_HIDE_POS = 14
 ID_SAVE_MAPPINGS = 15
 ID_EXPORT_TO_SCHEMATIC = 16
+ID_CONTEXT_MENU_COPY_LCSC = wx.NewIdRef()
+ID_CONTEXT_MENU_PASTE_LCSC = wx.NewIdRef()
 ID_CONTEXT_MENU_ADD_ROT_BY_PACKAGE = wx.NewIdRef()
 ID_CONTEXT_MENU_ADD_ROT_BY_NAME = wx.NewIdRef()
+ID_CONTEXT_MENU_FIND_MAPPING = wx.NewIdRef()
+ID_CONTEXT_MENU_ADD_MAPPING = wx.NewIdRef()
 
 
 class KicadProvider:
@@ -92,7 +96,6 @@ class JLCPCBTools(wx.Dialog):
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX,
         )
         self.pcbnew = kicad_provider.get_pcbnew()
-        self.KicadBuildVersion = self.pcbnew.GetBuildVersion()
         self.window = wx.GetTopLevelParent(self)
         self.SetSize(HighResWxSize(self.window, wx.Size(1300, 800)))
         self.scale_factor = GetScaleFactor(self.window)
@@ -101,8 +104,6 @@ class JLCPCBTools(wx.Dialog):
         self.schematic_name = f"{self.board_name.split('.')[0]}.kicad_sch"
         self.hide_bom_parts = False
         self.hide_pos_parts = False
-        self.manufacturers = []
-        self.packages = []
         self.library: Library
         self.store: Store
         self.settings = {}
@@ -236,8 +237,8 @@ class JLCPCBTools(wx.Dialog):
             "Assign a LCSC number to a footprint",
         )
 
-        self.remove_part_button = self.right_toolbar.AddTool(
-            ID_REMOVE_PART,
+        self.remove_lcsc_number_button = self.right_toolbar.AddTool(
+            ID_REMOVE_LCSC_NUMBER,
             "Remove LCSC number",
             loadBitmapScaled(
                 "mdi-close-box-outline.png",
@@ -339,7 +340,7 @@ class JLCPCBTools(wx.Dialog):
         )
 
         self.Bind(wx.EVT_TOOL, self.select_part, self.select_part_button)
-        self.Bind(wx.EVT_TOOL, self.remove_part, self.remove_part_button)
+        self.Bind(wx.EVT_TOOL, self.remove_lcsc_number, self.remove_lcsc_number_button)
         self.Bind(wx.EVT_TOOL, self.select_alike, self.select_alike_button)
         self.Bind(wx.EVT_TOOL, self.toggle_bom_pos, self.toggle_bom_pos_button)
         self.Bind(wx.EVT_TOOL, self.toggle_bom, self.toggle_bom_button)
@@ -355,106 +356,68 @@ class JLCPCBTools(wx.Dialog):
         # ---------------------------------------------------------------------
         # ----------------------- Footprint List ------------------------------
         # ---------------------------------------------------------------------
+
         table_sizer = wx.BoxSizer(wx.HORIZONTAL)
         table_sizer.SetMinSize(HighResWxSize(self.window, wx.Size(-1, 600)))
-        self.footprint_list = wx.dataview.DataViewListCtrl(
+
+        self.footprint_list = dv.DataViewCtrl(
             self,
-            wx.ID_ANY,
-            wx.DefaultPosition,
-            wx.DefaultSize,
-            style=wx.dataview.DV_MULTIPLE,
+            style=wx.BORDER_THEME | dv.DV_ROW_LINES | dv.DV_VERT_RULES | dv.DV_MULTIPLE,
         )
-        self.footprint_list.SetMinSize(HighResWxSize(self.window, wx.Size(750, 400)))
-        self.reference = self.footprint_list.AppendTextColumn(
-            "Reference",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 100),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+
+        reference = self.footprint_list.AppendTextColumn(
+            "Reference", 0, width=50, mode=dv.DATAVIEW_CELL_INERT, align=wx.ALIGN_CENTER
         )
-        self.value = self.footprint_list.AppendTextColumn(
-            "Value",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 200),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        value = self.footprint_list.AppendTextColumn(
+            "Value", 1, width=250, mode=dv.DATAVIEW_CELL_INERT, align=wx.ALIGN_CENTER
         )
-        self.footprint = self.footprint_list.AppendTextColumn(
+        footprint = self.footprint_list.AppendTextColumn(
             "Footprint",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 300),
+            2,
+            width=250,
+            mode=dv.DATAVIEW_CELL_INERT,
             align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
         )
-        self.lcsc = self.footprint_list.AppendTextColumn(
-            "LCSC",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 100),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        lcsc = self.footprint_list.AppendTextColumn(
+            "LCSC", 3, width=100, mode=dv.DATAVIEW_CELL_INERT, align=wx.ALIGN_CENTER
         )
-        self.type_column = self.footprint_list.AppendTextColumn(
-            "Type",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 100),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        type = self.footprint_list.AppendTextColumn(
+            "Type", 4, width=100, mode=dv.DATAVIEW_CELL_INERT, align=wx.ALIGN_CENTER
         )
-        self.stock = self.footprint_list.AppendTextColumn(
-            "Stock",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 100),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        stock = self.footprint_list.AppendTextColumn(
+            "Stock", 5, width=100, mode=dv.DATAVIEW_CELL_INERT, align=wx.ALIGN_CENTER
         )
-        self.bom = self.footprint_list.AppendIconTextColumn(
-            "BOM",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 40),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        bom = self.footprint_list.AppendIconTextColumn(
+            "BOM", 6, width=50, mode=dv.DATAVIEW_CELL_INERT
         )
-        self.pos = self.footprint_list.AppendIconTextColumn(
-            "POS",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 40),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        pos = self.footprint_list.AppendIconTextColumn(
+            "POS", 7, width=50, mode=dv.DATAVIEW_CELL_INERT
         )
-        self.rot = self.footprint_list.AppendTextColumn(
-            "Rotation",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 60),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        rotation = self.footprint_list.AppendTextColumn(
+            "Rotation", 8, width=70, mode=dv.DATAVIEW_CELL_INERT, align=wx.ALIGN_CENTER
         )
-        self.side = self.footprint_list.AppendTextColumn(
-            "Side",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            width=int(self.scale_factor * 40),
-            align=wx.ALIGN_CENTER,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
+        side = self.footprint_list.AppendIconTextColumn(
+            "Side", 9, width=50, mode=dv.DATAVIEW_CELL_INERT
         )
-        self.footprint_list.AppendTextColumn(
-            "",
-            mode=wx.dataview.DATAVIEW_CELL_INERT,
-            align=wx.ALIGN_CENTER,
-            width=1,
-            flags=wx.dataview.DATAVIEW_COL_RESIZABLE,
-        )
+
+        reference.SetSortable(True)
+        value.SetSortable(True)
+        footprint.SetSortable(True)
+        lcsc.SetSortable(True)
+        type.SetSortable(True)
+        stock.SetSortable(True)
+        bom.SetSortable(True)
+        pos.SetSortable(False)
+        rotation.SetSortable(True)
+        side.SetSortable(True)
+
         table_sizer.Add(self.footprint_list, 20, wx.ALL | wx.EXPAND, 5)
 
         self.footprint_list.Bind(
-            wx.dataview.EVT_DATAVIEW_COLUMN_HEADER_CLICK, self.OnSortFootprintList
+            dv.EVT_DATAVIEW_SELECTION_CHANGED, self.OnFootprintSelected
         )
 
-        self.footprint_list.Bind(
-            wx.dataview.EVT_DATAVIEW_SELECTION_CHANGED, self.OnFootprintSelected
-        )
-
-        self.footprint_list.Bind(
-            wx.dataview.EVT_DATAVIEW_ITEM_CONTEXT_MENU, self.OnRightDown
-        )
+        self.footprint_list.Bind(dv.EVT_DATAVIEW_ITEM_CONTEXT_MENU, self.OnRightDown)
 
         table_sizer.Add(self.right_toolbar, 1, wx.EXPAND, 5)
         # ---------------------------------------------------------------------
@@ -510,6 +473,8 @@ class JLCPCBTools(wx.Dialog):
         self.enable_part_specific_toolbar_buttons(False)
 
         self.init_logger()
+        self.partlist_data_model = PartListDataModel(self.scale_factor)
+        self.footprint_list.AssociateModel(self.partlist_data_model)
         self.init_library()
         self.init_fabrication()
         if self.library.state == LibraryState.UPDATE_NEEDED:
@@ -530,6 +495,12 @@ class JLCPCBTools(wx.Dialog):
     def init_library(self):
         """Initialize the parts library."""
         self.library = Library(self)
+        last_update = self.library.get_last_update()
+        if last_update:
+            last_update = dt.fromisoformat(last_update).strftime("%Y-%m-%d %H:%M")
+        self.SetTitle(
+            f"JLCPCB Tools [ {getVersion()} ] | Last database update: {last_update}",
+        )
 
     def init_store(self):
         """Initialize the store of part assignments."""
@@ -554,8 +525,11 @@ class JLCPCBTools(wx.Dialog):
         """Assign a selected LCSC number to parts."""
         for reference in e.references:
             self.store.set_lcsc(reference, e.lcsc)
-            self.store.set_stock(reference, e.stock)
-        self.populate_footprint_list()
+            self.store.set_stock(reference, int(e.stock))
+            board = self.pcbnew.GetBoard()
+            fp = board.FindFootprintByReference(reference)
+            set_lcsc_value(fp, e.lcsc)
+            self.partlist_data_model.set_lcsc(reference, e.lcsc, e.type, e.stock)
 
     def display_message(self, e):
         """Dispaly a message with the data from the event."""
@@ -566,82 +540,50 @@ class JLCPCBTools(wx.Dialog):
         }
         wx.MessageBox(e.text, e.title, style=styles.get(e.style, wx.ICON_INFORMATION))
 
+    def get_correction(self, part: dict, corrections: list) -> str:
+        """Try to find correction data for a given part."""
+        # First check if the part name matches
+        for regex, correction in corrections:
+            if re.search(regex, str(part["reference"])):
+                return str(correction)
+        # If there was no match for the part name, check if the package matches
+        for regex, correction in corrections:
+            if re.search(regex, str(part["footprint"])):
+                return str(correction)
+        return "0"
+
     def populate_footprint_list(self, *_):
-        """Populate/Refresh list of footprints."""
+        """Populate list of footprints."""
         if not self.store:
             self.init_store()
-        self.footprint_list.DeleteAllItems()
-        icons = {
-            0: wx.dataview.DataViewIconText(
-                "",
-                loadIconScaled(
-                    "mdi-check-color.png",
-                    self.scale_factor,
-                ),
-            ),
-            1: wx.dataview.DataViewIconText(
-                "",
-                loadIconScaled(
-                    "mdi-close-color.png",
-                    self.scale_factor,
-                ),
-            ),
-        }
-        numbers = []
-        parts = []
+        self.partlist_data_model.RemoveAll()
+        details = {}
+        corrections = self.library.get_all_correction_data()
         for part in self.store.read_all():
-            fp = self.pcbnew.GetBoard().FindFootprintByReference(part[0])
-            if part[3] and part[3] not in numbers:
-                numbers.append(part[3])
-            part.insert(4, "")
-            part[5] = str(part[5])
+            fp = self.pcbnew.GetBoard().FindFootprintByReference(part["reference"])
+            # Get part stock and type from library, skip if part number was already looked up before
+            if part["lcsc"] and part["lcsc"] not in details:
+                details[part["lcsc"]] = self.library.get_part_details(part["lcsc"])
             # don't show the part if hide BOM is set
-            if self.hide_bom_parts and part[6]:
+            if self.hide_bom_parts and part["exclude_from_bom"]:
                 continue
             # don't show the part if hide POS is set
-            if self.hide_pos_parts and part[7]:
+            if self.hide_pos_parts and part["exclude_from_pos"]:
                 continue
-            # decide which icon to use
-            part[6] = icons.get(part[6], icons.get(0))
-            part[7] = icons.get(part[7], icons.get(0))
-            part.insert(8, "")
-            side = "Top" if fp.GetLayer() == 0 else "Bot"
-            part.insert(9, side)
-            part.insert(10, "")
-            parts.append(part)
-        details = self.library.get_part_details(numbers)
-        corrections = self.library.get_all_correction_data()
-        # find rotation correction values
-        for part in parts:
-            detail = list(
-                filter(
-                    lambda x, lcsc=part[3]: x[0] == lcsc,
-                    details,
-                )
+            self.partlist_data_model.AddEntry(
+                [
+                    part["reference"],
+                    part["value"],
+                    part["footprint"],
+                    part["lcsc"],
+                    details.get(part["lcsc"], {}).get("type", ""),  # type
+                    details.get(part["lcsc"], {}).get("stock", ""),  # stock
+                    part["exclude_from_bom"],
+                    part["exclude_from_pos"],
+                    str(self.get_correction(part, corrections)),
+                    str(fp.GetLayer()),
+                ]
             )
-            if detail:
-                part[4] = detail[0][2]
-                if part[5] != str(detail[0][1]):
-                    part[5] = str(detail[0][1])
-                    self.store.set_stock(part[0], detail[0][1])
-            # First check if the part name mathes
-            for regex, correction in corrections:
-                if re.search(regex, str(part[1])):
-                    part[8] = str(correction)
-                    break
-            # If there was no match for the part name, check if the package matches
-            if part[8] == "":
-                for regex, correction in corrections:
-                    if re.search(regex, str(part[2])):
-                        part[8] = str(correction)
-                        break
-
-            self.footprint_list.AppendItem(part)
-
-    def OnSortFootprintList(self, e):
-        """Set order_by to the clicked column and trigger list refresh."""
-        self.store.set_order_by(e.GetColumn())
-        self.populate_footprint_list()
 
     def OnBomHide(self, *_):
         """Hide all parts from the list that have 'in BOM' set to No."""
@@ -723,30 +665,17 @@ class JLCPCBTools(wx.Dialog):
         # select all of the selected items in the footprint_list
         if self.footprint_list.GetSelectedItemsCount() > 0:
             for item in self.footprint_list.GetSelections():
-                row = self.footprint_list.ItemToRow(item)
-                ref = self.footprint_list.GetTextValue(row, 0)
+                ref = self.partlist_data_model.get_reference(item)
                 fp = self.pcbnew.GetBoard().FindFootprintByReference(ref)
-
                 fp.SetSelected()
-
             # cause pcbnew to refresh the board with the changes to the selected footprint(s)
             self.pcbnew.Refresh()
-
-    def enable_all_buttons(self, state):
-        """Control state of all the buttons."""
-        self.enable_top_buttons(state)
-        self.enable_part_specific_toolbar_buttons(state)
-
-    def enable_top_buttons(self, state):
-        """Control the state of all the buttons in the top section."""
-        for button in (ID_GENERATE, ID_DOWNLOAD, ID_LAYERS):
-            self.upper_toolbar.EnableTool(button, state)
 
     def enable_part_specific_toolbar_buttons(self, state):
         """Control the state of all the buttons that relate to parts in toolbar on the right side."""
         for button in (
             ID_SELECT_PART,
-            ID_REMOVE_PART,
+            ID_REMOVE_LCSC_NUMBER,
             ID_SELECT_ALIKE,
             ID_TOGGLE_BOM_POS,
             ID_TOGGLE_BOM,
@@ -759,122 +688,58 @@ class JLCPCBTools(wx.Dialog):
 
     def toggle_bom_pos(self, *_):
         """Toggle the exclude from BOM/POS attribute of a footprint."""
-        selected_rows = []
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            selected_rows.append(row)
-            ref = self.footprint_list.GetTextValue(row, 0)
+            ref = self.partlist_data_model.get_reference(item)
             board = self.pcbnew.GetBoard()
             fp = board.FindFootprintByReference(ref)
             bom = toggle_exclude_from_bom(fp)
             pos = toggle_exclude_from_pos(fp)
-            self.store.set_bom(ref, bom)
-            self.store.set_pos(ref, pos)
-            self.footprint_list.SetValue(
-                GetListIcon(bom, self.scale_factor), row, Column.BOM
-            )
-            self.footprint_list.SetValue(
-                GetListIcon(pos, self.scale_factor), row, Column.POS
-            )
+            self.store.set_bom(ref, int(bom))
+            self.store.set_pos(ref, int(pos))
+            self.partlist_data_model.toggle_bom_pos(item)
 
     def toggle_bom(self, *_):
         """Toggle the exclude from BOM attribute of a footprint."""
-        selected_rows = []
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            selected_rows.append(row)
-            ref = self.footprint_list.GetTextValue(row, 0)
+            ref = self.partlist_data_model.get_reference(item)
             board = self.pcbnew.GetBoard()
             fp = board.FindFootprintByReference(ref)
             bom = toggle_exclude_from_bom(fp)
-            self.store.set_bom(ref, bom)
-            self.footprint_list.SetValue(
-                GetListIcon(bom, self.scale_factor), row, Column.BOM
-            )
+            self.store.set_bom(ref, int(bom))
+            self.partlist_data_model.toggle_bom(item)
 
     def toggle_pos(self, *_):
         """Toggle the exclude from POS attribute of a footprint."""
-        selected_rows = []
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            selected_rows.append(row)
-            ref = self.footprint_list.GetTextValue(row, 0)
+            ref = self.partlist_data_model.get_reference(item)
             board = self.pcbnew.GetBoard()
             fp = board.FindFootprintByReference(ref)
             pos = toggle_exclude_from_pos(fp)
-            self.store.set_pos(ref, pos)
-            self.footprint_list.SetValue(
-                GetListIcon(pos, self.scale_factor), row, Column.POS
-            )
+            self.store.set_pos(ref, int(pos))
+            self.partlist_data_model.toggle_pos(item)
 
-    def remove_part(self, *_):
+    def remove_lcsc_number(self, *_):
         """Remove an assigned a LCSC Part number to a footprint."""
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            ref = self.footprint_list.GetTextValue(row, 0)
+            ref = self.partlist_data_model.get_reference(item)
             self.store.set_lcsc(ref, "")
-        self.populate_footprint_list()
+            self.store.set_stock(ref, None)
+            self.partlist_data_model.remove_lcsc_number(item)
 
     def select_alike(self, *_):
         """Select all parts that have the same value and footprint."""
-        num_sel = (
-            self.footprint_list.GetSelectedItemsCount()
-        )  # could have selected more than 1 item (by mistake?)
-        if num_sel == 1:
-            item = self.footprint_list.GetSelection()
-        else:
+        if self.footprint_list.GetSelectedItemsCount() > 1:
             self.logger.warning("Select only one component, please.")
             return
-        row = self.footprint_list.ItemToRow(item)
-        ref = self.footprint_list.GetValue(row, 0)
-        part = self.store.get_part(ref)
-        for r in range(self.footprint_list.GetItemCount()):
-            value = self.footprint_list.GetValue(r, 1)
-            fp = self.footprint_list.GetValue(r, 2)
-            if part[1] == value and part[2] == fp:
-                self.footprint_list.SelectRow(r)
+        item = self.footprint_list.GetSelection()
+        for item in self.partlist_data_model.select_alike(item):
+            self.footprint_list.Select(item)
 
     def get_part_details(self, *_):
         """Fetch part details from LCSC and show them one after another each in a modal."""
-        parts = self.get_selected_part_id_from_gui()
-        if not parts:
-            return
-
-        for part in parts:
-            self.show_part_details_dialog(part)
-
-    def get_column_by_name(self, column_title_to_find):
-        """Lookup a column in our main footprint table by matching its title."""
-        for col in self.footprint_list.Columns:
-            if col.Title == column_title_to_find:
-                return col
-        return None
-
-    def get_column_position_by_name(self, column_title_to_find):
-        """Lookup the index of a column in our main footprint table by matching its title."""
-        col = self.get_column_by_name(column_title_to_find)
-        if not col:
-            return -1
-        return self.footprint_list.GetColumnPosition(col)
-
-    def get_selected_part_id_from_gui(self):
-        """Get a list of LCSC part#s currently selected."""
-        lcsc_ids_selected = []
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            if row == -1:
-                continue
-
-            lcsc_id = self.get_row_item_in_column(row, "LCSC")
-            lcsc_ids_selected.append(lcsc_id)
-
-        return lcsc_ids_selected
-
-    def get_row_item_in_column(self, row, column_title):
-        """Get an item from a row based on the column title."""
-        return self.footprint_list.GetTextValue(
-            row, self.get_column_position_by_name(column_title)
-        )
+            if lcsc := self.partlist_data_model.get_lcsc(item):
+                self.show_part_details_dialog(lcsc)
 
     def show_part_details_dialog(self, part):
         """Show the part details modal dialog."""
@@ -924,21 +789,17 @@ class JLCPCBTools(wx.Dialog):
         ) as j:
             json.dump(self.settings, j)
 
-    def calculate_costs(self, *_):
-        """Hopefully we will be able to calculate the part costs in the future."""
-
     def select_part(self, *_):
         """Select a part from the library and assign it to the selected footprint(s)."""
         selection = {}
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            reference = self.footprint_list.GetTextValue(row, 0)
-            value = self.footprint_list.GetTextValue(row, 1)
-            lcsc = self.footprint_list.GetTextValue(row, 3)
+            ref = self.partlist_data_model.get_reference(item)
+            lcsc = self.partlist_data_model.get_lcsc(item)
+            value = self.partlist_data_model.get_value(item)
             if lcsc != "":
-                selection[reference] = lcsc
+                selection[ref] = lcsc
             else:
-                selection[reference] = value
+                selection[ref] = value
         PartSelectorDialog(self, selection).ShowModal()
 
     def generate_fabrication_data(self, *_):
@@ -959,13 +820,9 @@ class JLCPCBTools(wx.Dialog):
     def copy_part_lcsc(self, *_):
         """Fetch part details from LCSC and show them in a modal."""
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            if row == -1:
-                return
-            part = self.footprint_list.GetTextValue(row, 3)
-            if part != "":
+            if lcsc := self.partlist_data_model.get_lcsc(item):
                 if wx.TheClipboard.Open():
-                    wx.TheClipboard.SetData(wx.TextDataObject(part))
+                    wx.TheClipboard.SetData(wx.TextDataObject(lcsc))
                     wx.TheClipboard.Close()
 
     def paste_part_lcsc(self, *_):
@@ -975,41 +832,36 @@ class JLCPCBTools(wx.Dialog):
             success = wx.TheClipboard.GetData(text_data)
             wx.TheClipboard.Close()
         if success:
-            lcsc = self.sanitize_lcsc(text_data.GetText())
-            if lcsc == "":
-                return
-            for item in self.footprint_list.GetSelections():
-                row = self.footprint_list.ItemToRow(item)
-                reference = self.footprint_list.GetTextValue(row, 0)
-                self.store.set_lcsc(reference, lcsc)
-            self.populate_footprint_list()
+            if (lcsc := self.sanitize_lcsc(text_data.GetText())) != "":
+                for item in self.footprint_list.GetSelections():
+                    details = self.library.get_part_details(lcsc)
+                    reference = self.partlist_data_model.get_reference(item)
+                    self.partlist_data_model.set_lcsc(
+                        reference, lcsc, details["type"], details["stock"]
+                    )
+                    self.store.set_lcsc(reference, lcsc)
 
-    def add_part_rot(self, e):
+    def add_rotation(self, e):
         """Add part rotation for the current part."""
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            if row == -1:
-                return
             if e.GetId() == ID_CONTEXT_MENU_ADD_ROT_BY_PACKAGE:
-                package = self.footprint_list.GetTextValue(row, 2)
-                if package != "":
-                    RotationManagerDialog(self, "^" + re.escape(package)).ShowModal()
+                if footprint := self.partlist_data_model.get_footprint(item):
+                    RotationManagerDialog(self, "^" + re.escape(footprint)).ShowModal()
             elif e.GetId() == ID_CONTEXT_MENU_ADD_ROT_BY_NAME:
-                name = self.footprint_list.GetTextValue(row, 1)
-                if name != "":
-                    RotationManagerDialog(self, re.escape(name)).ShowModal()
+                if value := self.partlist_data_model.get_value(item):
+                    RotationManagerDialog(self, re.escape(value)).ShowModal()
 
     def save_all_mappings(self, *_):
         """Save all mappings."""
-        for r in range(self.footprint_list.GetItemCount()):
-            footp = self.footprint_list.GetTextValue(r, 2)
-            partval = self.footprint_list.GetTextValue(r, 1)
-            lcscpart = self.footprint_list.GetTextValue(r, 3)
-            if footp != "" and partval != "" and lcscpart != "":
-                if self.library.get_mapping_data(footp, partval):
-                    self.library.update_mapping_data(footp, partval, lcscpart)
+        for item in self.partlist_data_model.get_all():
+            value = item[1]
+            footprint = item[2]
+            lcsc = item[3]
+            if footprint != "" and value != "" and lcsc != "":
+                if self.library.get_mapping_data(footprint, value):
+                    self.library.update_mapping_data(footprint, value, lcsc)
                 else:
-                    self.library.insert_mapping_data(footp, partval, lcscpart)
+                    self.library.insert_mapping_data(footprint, value, lcsc)
         self.logger.info("All mappings saved")
 
     def export_to_schematic(self, *_):
@@ -1030,33 +882,30 @@ class JLCPCBTools(wx.Dialog):
     def add_foot_mapping(self, *_):
         """Add a footprint mapping."""
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            if row == -1:
-                return
-            footp = self.footprint_list.GetTextValue(row, 2)
-            partval = self.footprint_list.GetTextValue(row, 1)
-            lcscpart = self.footprint_list.GetTextValue(row, 3)
-            if footp != "" and partval != "" and lcscpart != "":
-                if self.library.get_mapping_data(footp, partval):
-                    self.library.update_mapping_data(footp, partval, lcscpart)
+            footprint = self.partlist_data_model.get_footprint(item)
+            value = self.partlist_data_model.get_value(item)
+            lcsc = self.partlist_data_model.get_lcsc(item)
+            if footprint != "" and value != "" and lcsc != "":
+                if self.library.get_mapping_data(footprint, value):
+                    self.library.update_mapping_data(footprint, value, lcsc)
                 else:
-                    self.library.insert_mapping_data(footp, partval, lcscpart)
+                    self.library.insert_mapping_data(footprint, value, lcsc)
 
     def search_foot_mapping(self, *_):
         """Search for a footprint mapping."""
         for item in self.footprint_list.GetSelections():
-            row = self.footprint_list.ItemToRow(item)
-            if row == -1:
-                return
-            footp = self.footprint_list.GetTextValue(row, 2)
-            partval = self.footprint_list.GetTextValue(row, 1)
-            if footp != "" and partval != "":
-                if self.library.get_mapping_data(footp, partval):
-                    lcsc = self.library.get_mapping_data(footp, partval)[2]
-                    reference = self.footprint_list.GetTextValue(row, 0)
+            reference = self.partlist_data_model.get_reference(item)
+            footprint = self.partlist_data_model.get_footprint(item)
+            value = self.partlist_data_model.get_value(item)
+            if footprint != "" and value != "":
+                if self.library.get_mapping_data(footprint, value):
+                    lcsc = self.library.get_mapping_data(footprint, value)[2]
                     self.store.set_lcsc(reference, lcsc)
                     self.logger.info("Found %s", lcsc)
-        self.populate_footprint_list()
+                    details = self.library.get_part_details(lcsc)
+                    self.partlist_data_model.set_lcsc(
+                        reference, lcsc, details["type"], details["stock"]
+                    )
 
     def sanitize_lcsc(self, lcsc_PN):
         """Sanitize a given LCSC number using a regex."""
@@ -1067,37 +916,48 @@ class JLCPCBTools(wx.Dialog):
 
     def OnRightDown(self, *_):
         """Right click context menu for action on parts table."""
-        conMenu = wx.Menu()
-        copy_lcsc = wx.MenuItem(conMenu, wx.NewIdRef(), "Copy LCSC")
-        conMenu.Append(copy_lcsc)
-        conMenu.Bind(wx.EVT_MENU, self.copy_part_lcsc, copy_lcsc)
+        right_click_menu = wx.Menu()
 
-        paste_lcsc = wx.MenuItem(conMenu, wx.NewIdRef(), "Paste LCSC")
-        conMenu.Append(paste_lcsc)
-        conMenu.Bind(wx.EVT_MENU, self.paste_part_lcsc, paste_lcsc)
+        copy_lcsc = wx.MenuItem(
+            right_click_menu, ID_CONTEXT_MENU_COPY_LCSC, "Copy LCSC"
+        )
+        right_click_menu.Append(copy_lcsc)
+        right_click_menu.Bind(wx.EVT_MENU, self.copy_part_lcsc, copy_lcsc)
+
+        paste_lcsc = wx.MenuItem(
+            right_click_menu, ID_CONTEXT_MENU_PASTE_LCSC, "Paste LCSC"
+        )
+        right_click_menu.Append(paste_lcsc)
+        right_click_menu.Bind(wx.EVT_MENU, self.paste_part_lcsc, paste_lcsc)
 
         rotation_by_package = wx.MenuItem(
-            conMenu, ID_CONTEXT_MENU_ADD_ROT_BY_PACKAGE, "Add Rotation by package"
+            right_click_menu,
+            ID_CONTEXT_MENU_ADD_ROT_BY_PACKAGE,
+            "Add Rotation by package",
         )
-        conMenu.Append(rotation_by_package)
-        conMenu.Bind(wx.EVT_MENU, self.add_part_rot, rotation_by_package)
+        right_click_menu.Append(rotation_by_package)
+        right_click_menu.Bind(wx.EVT_MENU, self.add_rotation, rotation_by_package)
 
         rotation_by_name = wx.MenuItem(
-            conMenu, ID_CONTEXT_MENU_ADD_ROT_BY_NAME, "Add Rotation by name"
+            right_click_menu, ID_CONTEXT_MENU_ADD_ROT_BY_NAME, "Add Rotation by name"
         )
-        conMenu.Append(rotation_by_name)
-        conMenu.Bind(wx.EVT_MENU, self.add_part_rot, rotation_by_name)
+        right_click_menu.Append(rotation_by_name)
+        right_click_menu.Bind(wx.EVT_MENU, self.add_rotation, rotation_by_name)
 
-        find_mapping = wx.MenuItem(conMenu, wx.NewIdRef(), "Find LCSC from Mappings")
-        conMenu.Append(find_mapping)
-        conMenu.Bind(wx.EVT_MENU, self.search_foot_mapping, find_mapping)
+        find_mapping = wx.MenuItem(
+            right_click_menu, ID_CONTEXT_MENU_FIND_MAPPING, "Find LCSC from Mappings"
+        )
+        right_click_menu.Append(find_mapping)
+        right_click_menu.Bind(wx.EVT_MENU, self.search_foot_mapping, find_mapping)
 
-        add_mapping = wx.MenuItem(conMenu, wx.NewIdRef(), "Add Footprint Mapping")
-        conMenu.Append(add_mapping)
-        conMenu.Bind(wx.EVT_MENU, self.add_foot_mapping, add_mapping)
+        add_mapping = wx.MenuItem(
+            right_click_menu, ID_CONTEXT_MENU_ADD_MAPPING, "Add Footprint Mapping"
+        )
+        right_click_menu.Append(add_mapping)
+        right_click_menu.Bind(wx.EVT_MENU, self.add_foot_mapping, add_mapping)
 
-        self.footprint_list.PopupMenu(conMenu)
-        conMenu.Destroy()  # destroy to avoid memory leak
+        self.footprint_list.PopupMenu(right_click_menu)
+        right_click_menu.Destroy()  # destroy to avoid memory leak
 
     def init_logger(self):
         """Initialize logger to log into textbox."""
@@ -1131,7 +991,7 @@ class LogBoxHandler(logging.StreamHandler):
         logging.StreamHandler.__init__(self)
         self.event_destination = event_destination
 
-    def emit(self, record):
+    def emit(self, record):  # noqa: DC04
         """Marshal the event over to the main thread."""
         msg = self.format(record)
         wx.QueueEvent(self.event_destination, LogboxAppendEvent(msg=f"{msg}\n"))

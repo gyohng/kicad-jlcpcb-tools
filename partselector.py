@@ -67,6 +67,26 @@ class PartSelectorDialog(wx.Dialog):
         )
         self.keyword.SetHint("e.g. 10k 0603")
 
+        self.ohm_button = wx.Button(
+            self,
+            wx.ID_ANY,
+            "Ω",
+            wx.DefaultPosition,
+            HighResWxSize(parent.window, wx.Size(20, -1)),
+            0,
+        )
+        self.ohm_button.SetToolTip("Append the Ω symbol to the search string")
+
+        self.micro_button = wx.Button(
+            self,
+            wx.ID_ANY,
+            "µ",
+            wx.DefaultPosition,
+            HighResWxSize(parent.window, wx.Size(20, -1)),
+            0,
+        )
+        self.micro_button.SetToolTip("Append the µ symbol to the search string")
+
         manufacturer_label = wx.StaticText(
             self,
             wx.ID_ANY,
@@ -239,6 +259,18 @@ class PartSelectorDialog(wx.Dialog):
             wx.LEFT | wx.RIGHT | wx.BOTTOM,
             5,
         )
+        keyword_search_row1.Add(
+            self.ohm_button,
+            0,
+            wx.LEFT | wx.RIGHT | wx.BOTTOM,
+            5,
+        )
+        keyword_search_row1.Add(
+            self.micro_button,
+            0,
+            wx.LEFT | wx.RIGHT | wx.BOTTOM,
+            5,
+        )
 
         search_sizer_one = wx.BoxSizer(wx.VERTICAL)
         search_sizer_one.Add(manufacturer_label, 0, wx.ALL, 5)
@@ -342,6 +374,8 @@ class PartSelectorDialog(wx.Dialog):
         search_sizer.Add(search_sizer_row2)
 
         self.keyword.Bind(wx.EVT_TEXT, self.search_dwell)
+        self.ohm_button.Bind(wx.EVT_BUTTON, self.add_ohm_symbol)
+        self.micro_button.Bind(wx.EVT_BUTTON, self.add_micro_symbol)
         self.manufacturer.Bind(wx.EVT_TEXT, self.search_dwell)
         self.package.Bind(wx.EVT_TEXT, self.search_dwell)
         self.category.Bind(wx.EVT_COMBOBOX, self.update_subcategories)
@@ -561,6 +595,14 @@ class PartSelectorDialog(wx.Dialog):
         ]:
             b.Enable(bool(state))
 
+    def add_ohm_symbol(self, *_):
+        """Append the Ω symbol to the search string."""
+        self.keyword.AppendText("Ω")
+
+    def add_micro_symbol(self, *_):
+        """Append the µ symbol to the search string."""
+        self.keyword.AppendText("µ")
+
     def search_dwell(self, *_):
         """Initiate a search once the timeout expires.
 
@@ -600,6 +642,25 @@ class PartSelectorDialog(wx.Dialog):
         # search now that categories might have changed
         self.search(None)
 
+    def get_price(self, quantity, prices) -> float:
+        """Find the price for the number of selected parts accordning to the price ranges."""
+        price_ranges = prices.split(",")
+        if not price_ranges[0]:
+            return -1.0
+        min_quantity = int(price_ranges[0].split("-")[0])
+        if quantity <= min_quantity:
+            range, price = price_ranges[0].split(":")
+            return float(price)
+        for p in price_ranges:
+            range, price = p.split(":")
+            lower, upper = range.split("-")
+            if not upper:  # upper bound of price ranges
+                return float(price)
+            lower = int(lower)
+            upper = int(upper)
+            if lower <= quantity < upper:
+                return float(price)
+
     def populate_part_list(self, parts, search_duration):
         """Populate the list with the result of the search."""
         search_duration_text = (
@@ -619,20 +680,15 @@ class PartSelectorDialog(wx.Dialog):
             self.result_count.SetLabel(f"{count} Results in {search_duration_text}")
         for p in parts:
             item = [str(c) for c in p]
-            # Munge price to be more readable
             pricecol = 8  # Must match order in library.py search function
-            price = []
-            try:
-                for t in item[pricecol].split(","):
-                    qty, p = t.split(":")
-                    p = float(p)
-                    if p < 1.0:
-                        price.append(f"{qty}: {p * 100:.2f}c")
-                    else:
-                        price.append(f"{qty}: ${p:.2f}")
-                item[pricecol] = ", ".join(price)
-            except ValueError:
-                self.logger.warning("unable to parse price %s", item[pricecol])
+            price = round(self.get_price(len(self.parts), item[pricecol]), 3)
+            if price > 0:
+                sum = round(price * len(self.parts), 3)
+                item[pricecol] = (
+                    f"{len(self.parts)} parts: ${price} each / ${sum} total"
+                )
+            else:
+                item[pricecol] = "Error in price data"
             self.part_list.AppendItem(item)
 
     def select_part(self, *_):
@@ -642,11 +698,13 @@ class PartSelectorDialog(wx.Dialog):
         if row == -1:
             return
         selection = self.part_list.GetTextValue(row, 0)
+        type = self.part_list.GetTextValue(row, 4)
         stock = self.part_list.GetTextValue(row, 5)
         wx.PostEvent(
             self.parent,
             AssignPartsEvent(
                 lcsc=selection,
+                type=type,
                 stock=stock,
                 references=self.parts.keys(),
             ),
